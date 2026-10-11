@@ -1,3 +1,7 @@
+import json
+import os
+import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 
@@ -16,6 +20,14 @@ LINE_SPACING = 8
 BLOCK_SPACING = 20
 BOTTOM_PADDING = 80
 FEED_MARK_SIZE = 2
+GOOGLE_POLL_SECONDS = 60
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+GOOGLE_CREDENTIALS_FILE = os.path.join(APP_DIR, "credentials.json")
+GOOGLE_TOKEN_FILE = os.path.join(APP_DIR, "token.json")
+PRINTED_TASKS_FILE = os.path.join(APP_DIR, "printed_tasks.json")
+APP_SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+GOOGLE_TASKS_SCOPES = ["https://www.googleapis.com/auth/tasks.readonly"]
 
 INK_DARK = "#171421"
 INK_PANEL = "#241d35"
@@ -271,6 +283,210 @@ def set_widget_state(widget, enabled):
     widget.configure(state=state)
 
 
+def load_printed_task_ids():
+    if not os.path.exists(PRINTED_TASKS_FILE):
+        return set()
+
+    try:
+        with open(PRINTED_TASKS_FILE, "r", encoding="utf-8") as file:
+            return set(json.load(file))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def save_printed_task_ids(task_ids):
+    with open(PRINTED_TASKS_FILE, "w", encoding="utf-8") as file:
+        json.dump(sorted(task_ids), file, indent=2)
+
+
+def clamp_int(value, default, minimum, maximum):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+
+    return max(minimum, min(maximum, number))
+
+
+def load_app_settings():
+    defaults = {
+        "title_size": TITLE_FONT_SIZE,
+        "body_size": BODY_FONT_SIZE,
+        "meta_size": META_FONT_SIZE,
+        "bottom_padding": BOTTOM_PADDING,
+    }
+
+    if not os.path.exists(APP_SETTINGS_FILE):
+        return defaults
+
+    try:
+        with open(APP_SETTINGS_FILE, "r", encoding="utf-8") as file:
+            saved = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return defaults
+
+    return {
+        "title_size": clamp_int(saved.get("title_size"), TITLE_FONT_SIZE, 24, 96),
+        "body_size": clamp_int(saved.get("body_size"), BODY_FONT_SIZE, 18, 72),
+        "meta_size": clamp_int(saved.get("meta_size"), META_FONT_SIZE, 18, 72),
+        "bottom_padding": clamp_int(saved.get("bottom_padding"), BOTTOM_PADDING, 0, 400),
+    }
+
+
+def save_app_settings(settings):
+    with open(APP_SETTINGS_FILE, "w", encoding="utf-8") as file:
+        json.dump(settings, file, indent=2)
+
+
+def format_google_due_date(due_value):
+    if not due_value:
+        return ""
+
+    date_part = due_value.split("T", 1)[0]
+    year, month, day = date_part.split("-", 2)
+    return f"{day}.{month}.{year}"
+
+
+def get_google_tasks_service():
+    try:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise RuntimeError(
+            "Google-kirjastot puuttuvat. Asenna ne komennolla: "
+            "pip install -r requirements.txt"
+        ) from exc
+
+    if not os.path.exists(GOOGLE_CREDENTIALS_FILE):
+        raise RuntimeError(
+            "credentials.json puuttuu projektikansiosta. Luo OAuth Client ID "
+            "Google Cloudissa ja tallenna ladattu tiedosto nimella credentials.json."
+        )
+
+    credentials = None
+    if os.path.exists(GOOGLE_TOKEN_FILE):
+        credentials = Credentials.from_authorized_user_file(
+            GOOGLE_TOKEN_FILE,
+            GOOGLE_TASKS_SCOPES,
+        )
+
+    if not credentials or not credentials.valid:
+        if credentials and credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                GOOGLE_CREDENTIALS_FILE,
+                GOOGLE_TASKS_SCOPES,
+            )
+            credentials = flow.run_local_server(port=0)
+
+        with open(GOOGLE_TOKEN_FILE, "w", encoding="utf-8") as token_file:
+            token_file.write(credentials.to_json())
+
+    return build("tasks", "v1", credentials=credentials)
+
+
+def list_open_google_tasks(service):
+    task_items = []
+    task_lists = service.tasklists().list(maxResults=100).execute().get("items", [])
+
+    for task_list in task_lists:
+        page_token = None
+
+        while True:
+            response = (
+                service.tasks()
+                .list(
+                    tasklist=task_list["id"],
+                    showCompleted=False,
+                    showDeleted=False,
+                    showHidden=True,
+                    maxResults=100,
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+
+            for task in response.get("items", []):
+                if task.get("status") == "completed" or task.get("deleted"):
+                    continue
+                task_items.append(
+                    {
+                        "id": f'{task_list["id"]}:{task["id"]}',
+                        "title": task.get("title", "Nimeton tehtava"),
+                        "notes": task.get("notes", ""),
+                        "due": format_google_due_date(task.get("due")),
+                        "task_list": task_list.get("title", "Google Tasks"),
+                    }
+                )
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    return task_items
+
+
+def make_google_task_receipt(task):
+    notes = task["notes"].strip()
+    due = task["due"].strip()
+    settings = load_app_settings()
+
+    return {
+        "use_title": True,
+        "title": task["title"],
+        "use_body": bool(notes),
+        "body": notes,
+        "use_deadline": bool(due),
+        "deadline": due,
+        "use_category": True,
+        "category_icon": "[ ]",
+        "category_name": task["task_list"],
+        "title_size": settings["title_size"],
+        "body_size": settings["body_size"],
+        "meta_size": settings["meta_size"],
+        "bottom_padding": settings["bottom_padding"],
+    }
+
+
+def run_google_tasks_monitor(stop_event, update_status):
+    update_status("Google Tasks: kaynnistetaan...")
+
+    try:
+        service = get_google_tasks_service()
+    except Exception as exc:
+        update_status(f"Google Tasks ei kaynnistynyt: {exc}")
+        return
+
+    update_status("Google Tasks: kuuntelu kaynnissa.")
+
+    while not stop_event.is_set():
+        try:
+            printed_task_ids = load_printed_task_ids()
+            tasks = list_open_google_tasks(service)
+            new_tasks = [task for task in tasks if task["id"] not in printed_task_ids]
+
+            if new_tasks:
+                update_status(f"Google Tasks: tulostetaan {len(new_tasks)} uutta tehtavaa.")
+
+            for task in new_tasks:
+                if stop_event.is_set():
+                    break
+
+                print_receipt(make_google_task_receipt(task))
+                printed_task_ids.add(task["id"])
+                save_printed_task_ids(printed_task_ids)
+
+            if not new_tasks:
+                update_status("Google Tasks: ei uusia tehtavia.")
+        except Exception as exc:
+            update_status(f"Google Tasks virhe: {exc}")
+
+        stop_event.wait(GOOGLE_POLL_SECONDS)
+
+
 def main():
     root = tk.Tk()
     root.title("Kuittitulostin")
@@ -307,16 +523,40 @@ def main():
     frame.columnconfigure(1, weight=1)
     frame.rowconfigure(2, weight=1)
 
+    saved_settings = load_app_settings()
+
     use_title = tk.BooleanVar(value=True)
     use_body = tk.BooleanVar(value=True)
     use_deadline = tk.BooleanVar(value=False)
     use_category = tk.BooleanVar(value=True)
-    title_size = tk.IntVar(value=TITLE_FONT_SIZE)
-    body_size = tk.IntVar(value=BODY_FONT_SIZE)
-    meta_size = tk.IntVar(value=META_FONT_SIZE)
-    bottom_padding = tk.IntVar(value=BOTTOM_PADDING)
+    title_size = tk.IntVar(value=saved_settings["title_size"])
+    body_size = tk.IntVar(value=saved_settings["body_size"])
+    meta_size = tk.IntVar(value=saved_settings["meta_size"])
+    bottom_padding = tk.IntVar(value=saved_settings["bottom_padding"])
     category_var = tk.StringVar(value=f"{CATEGORY_OPTIONS[0][0]} {CATEGORY_OPTIONS[0][1]}")
     status_var = tk.StringVar()
+    google_status_var = tk.StringVar(value="Google Tasks: odottaa kaynnistysta.")
+    google_stop_event = threading.Event()
+    google_thread = None
+
+    def read_current_settings():
+        try:
+            return {
+                "title_size": title_size.get(),
+                "body_size": body_size.get(),
+                "meta_size": meta_size.get(),
+                "bottom_padding": bottom_padding.get(),
+            }
+        except tk.TclError:
+            return None
+
+    def save_current_settings():
+        current_settings = read_current_settings()
+        if current_settings is not None:
+            save_app_settings(current_settings)
+
+    for setting_var in (title_size, body_size, meta_size, bottom_padding):
+        setting_var.trace_add("write", lambda *_args: save_current_settings())
 
     title_entry = tk.Entry(frame, font=("Consolas", 12))
     body_text = tk.Text(frame, wrap=tk.WORD, font=("Consolas", 12), height=10)
@@ -471,6 +711,23 @@ def main():
             style_label(child, muted=index != 0)
     spacing_frame.winfo_children()[0].configure(fg=INK_PINK)
 
+    google_frame = tk.Frame(frame, bg=INK_PANEL, padx=12, pady=10)
+    google_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    google_frame.columnconfigure(1, weight=1)
+
+    google_title = tk.Label(google_frame, text="Google Tasks")
+    google_title.grid(row=0, column=0, sticky="w", padx=(0, 12))
+    style_label(google_title)
+    google_title.configure(fg=INK_CYAN)
+
+    google_status_label = tk.Label(
+        google_frame,
+        textvariable=google_status_var,
+        anchor="w",
+    )
+    google_status_label.grid(row=0, column=1, sticky="ew")
+    style_label(google_status_label, muted=True)
+
     set_widget_state(deadline_entry, use_deadline.get())
 
     def read_category():
@@ -560,6 +817,7 @@ def main():
             return
 
         try:
+            save_current_settings()
             printer_name = win32print.GetDefaultPrinter()
             print_receipt(receipt)
         except Exception as exc:
@@ -569,8 +827,28 @@ def main():
 
         status_var.set(f"Tulostettu: {printer_name}")
 
+    def update_google_status(message):
+        root.after(0, google_status_var.set, message)
+
+    def start_google_monitor():
+        nonlocal google_thread
+        if google_thread and google_thread.is_alive():
+            return
+
+        google_thread = threading.Thread(
+            target=run_google_tasks_monitor,
+            args=(google_stop_event, update_google_status),
+            daemon=True,
+        )
+        google_thread.start()
+
+    def on_close():
+        save_current_settings()
+        google_stop_event.set()
+        root.destroy()
+
     controls = tk.Frame(frame, bg=INK_DARK)
-    controls.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+    controls.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
     controls.columnconfigure(0, weight=1)
 
     status_label = tk.Label(controls, textvariable=status_var, anchor="w")
@@ -595,6 +873,8 @@ def main():
     print_button.grid(row=0, column=1, sticky="e")
 
     title_entry.focus_set()
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.after(1000, start_google_monitor)
     root.mainloop()
 
 
